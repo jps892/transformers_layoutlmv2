@@ -14,15 +14,23 @@
 # limitations under the License.
 """ PyTorch LayoutLMv2 model."""
 
+
 import math
-from typing import Optional, Tuple, Union
 import copy
+import numpy as np
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
+from ...file_utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    is_detectron2_available,
+    replace_return_docstrings,
+    requires_backends,
+)
 from ...modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPooling,
@@ -31,16 +39,8 @@ from ...modeling_outputs import (
     TokenClassifierOutput,
 )
 from .outputs_layoutlmv2 import RegionExtractionOutput
-from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import apply_chunking_to_forward, torch_int_div
-from ...utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_detectron2_available,
-    logging,
-    replace_return_docstrings,
-    requires_backends,
-)
+from ...modeling_utils import PreTrainedModel, apply_chunking_to_forward
+from ...utils import logging
 from .configuration_layoutlmv2 import LayoutLMv2Config
 
 
@@ -179,9 +179,7 @@ class LayoutLMv2SelfAttention(nn.Module):
             attention_scores += rel_pos
         if self.has_spatial_attention_bias:
             attention_scores += rel_2d_pos
-        attention_scores = attention_scores.float().masked_fill_(
-            attention_mask.to(torch.bool), torch.finfo(attention_scores.dtype).min
-        )
+        attention_scores = attention_scores.float().masked_fill_(attention_mask.to(torch.bool), float("-inf"))
         attention_probs = nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32).type_as(value_layer)
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -252,7 +250,7 @@ class LayoutLMv2Intermediate(nn.Module):
         else:
             self.intermediate_act_fn = config.hidden_act
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
@@ -266,7 +264,7 @@ class LayoutLMv2Output(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states, input_tensor):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
@@ -685,7 +683,7 @@ LAYOUTLMV2_INPUTS_DOCSTRING = r"""
             Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
             more detail.
         return_dict (`bool`, *optional*):
-            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+            Whether or not to return a [`~file_utils.ModelOutput`] instead of a plain tuple.
 """
 
 
@@ -772,25 +770,25 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
         return embeddings
 
     def _calc_visual_bbox(self, image_feature_pool_shape, bbox, device, final_shape):
-        visual_bbox_x = torch_int_div(
+        visual_bbox_x = (
             torch.arange(
                 0,
                 1000 * (image_feature_pool_shape[1] + 1),
                 1000,
                 device=device,
                 dtype=bbox.dtype,
-            ),
-            self.config.image_feature_pool_shape[1],
+            )
+            // self.config.image_feature_pool_shape[1]
         )
-        visual_bbox_y = torch_int_div(
+        visual_bbox_y = (
             torch.arange(
                 0,
                 1000 * (self.config.image_feature_pool_shape[0] + 1),
                 1000,
                 device=device,
                 dtype=bbox.dtype,
-            ),
-            self.config.image_feature_pool_shape[0],
+            )
+            // self.config.image_feature_pool_shape[0]
         )
         visual_bbox = torch.stack(
             [
@@ -806,76 +804,62 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
 
         return visual_bbox
 
-    def _get_input_shape(self, input_ids=None, inputs_embeds=None):
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            return input_ids.size()
-        elif inputs_embeds is not None:
-            return inputs_embeds.size()[:-1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-
     @add_start_docstrings_to_model_forward(LAYOUTLMV2_INPUTS_DOCSTRING.format("(batch_size, sequence_length)"))
     @replace_return_docstrings(output_type=BaseModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        image: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        input_ids=None,
+        bbox=None,
+        image=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
         r"""
-        Return:
+        Returns:
 
         Examples:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2Model, set_seed
+        >>> from transformers import LayoutLMv2Processor, LayoutLMv2Model
         >>> from PIL import Image
-        >>> import torch
-        >>> from datasets import load_dataset
-
-        >>> set_seed(88)
 
         >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
         >>> model = LayoutLMv2Model.from_pretrained("microsoft/layoutlmv2-base-uncased")
 
-
-        >>> dataset = load_dataset("hf-internal-testing/fixtures_docvqa")
-        >>> image_path = dataset["test"][0]["file"]
-        >>> image = Image.open(image_path).convert("RGB")
+        >>> image = Image.open("name_of_your_document - can be a png file, pdf, etc.").convert("RGB")
 
         >>> encoding = processor(image, return_tensors="pt")
 
         >>> outputs = model(**encoding)
         >>> last_hidden_states = outputs.last_hidden_state
-
-        >>> last_hidden_states.shape
-        torch.Size([1, 342, 768])
-        ```
-        """
+        ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        input_shape = self._get_input_shape(input_ids, inputs_embeds)
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         visual_shape = list(input_shape)
         visual_shape[1] = self.config.image_feature_pool_shape[0] * self.config.image_feature_pool_shape[1]
         visual_shape = torch.Size(visual_shape)
-        # needs a new copy of input_shape for tracing. Otherwise wrong dimensions will occur
-        final_shape = list(self._get_input_shape(input_ids, inputs_embeds))
+        final_shape = list(input_shape)
         final_shape[1] += visual_shape[1]
         final_shape = torch.Size(final_shape)
 
@@ -922,7 +906,7 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
         extended_attention_mask = final_attention_mask.unsqueeze(1).unsqueeze(2)
 
         extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(self.dtype).min
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         if head_mask is not None:
             if head_mask.dim() == 1:
@@ -985,19 +969,19 @@ class LayoutLMv2ForSequenceClassification(LayoutLMv2PreTrainedModel):
     @replace_return_docstrings(output_type=SequenceClassifierOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        image: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, SequenceClassifierOutput]:
+        input_ids=None,
+        bbox=None,
+        image=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
@@ -1006,37 +990,25 @@ class LayoutLMv2ForSequenceClassification(LayoutLMv2PreTrainedModel):
 
         Returns:
 
-        Example:
+        Examples:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForSequenceClassification, set_seed
+        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForSequenceClassification
         >>> from PIL import Image
         >>> import torch
-        >>> from datasets import load_dataset
-
-        >>> set_seed(88)
-
-        >>> dataset = load_dataset("rvl_cdip", split="train", streaming=True)
-        >>> data = next(iter(dataset))
-        >>> image = data["image"].convert("RGB")
 
         >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
-        >>> model = LayoutLMv2ForSequenceClassification.from_pretrained(
-        ...     "microsoft/layoutlmv2-base-uncased", num_labels=dataset.info.features["label"].num_classes
-        ... )
+        >>> model = LayoutLMv2ForSequenceClassification.from_pretrained("microsoft/layoutlmv2-base-uncased")
+
+        >>> image = Image.open("name_of_your_document - can be a png file, pdf, etc.").convert("RGB")
 
         >>> encoding = processor(image, return_tensors="pt")
-        >>> sequence_label = torch.tensor([data["label"]])
+        >>> sequence_label = torch.tensor([1])
 
         >>> outputs = model(**encoding, labels=sequence_label)
-
-        >>> loss, logits = outputs.loss, outputs.logits
-        >>> predicted_idx = logits.argmax(dim=-1).item()
-        >>> predicted_answer = dataset.info.features["label"].names[4]
-        >>> predicted_idx, predicted_answer
-        (4, 'advertisement')
-        ```
-        """
+        >>> loss = outputs.loss
+        >>> logits = outputs.logits
+        ```"""
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1166,67 +1138,45 @@ class LayoutLMv2ForTokenClassification(LayoutLMv2PreTrainedModel):
     @replace_return_docstrings(output_type=TokenClassifierOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        image: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, TokenClassifierOutput]:
+        input_ids=None,
+        bbox=None,
+        image=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
 
         Returns:
 
-        Example:
+        Examples:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForTokenClassification, set_seed
+        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForTokenClassification
         >>> from PIL import Image
-        >>> from datasets import load_dataset
-
-        >>> set_seed(88)
-
-        >>> datasets = load_dataset("nielsr/funsd", split="test")
-        >>> labels = datasets.features["ner_tags"].feature.names
-        >>> id2label = {v: k for v, k in enumerate(labels)}
 
         >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased", revision="no_ocr")
-        >>> model = LayoutLMv2ForTokenClassification.from_pretrained(
-        ...     "microsoft/layoutlmv2-base-uncased", num_labels=len(labels)
-        ... )
+        >>> model = LayoutLMv2ForTokenClassification.from_pretrained("microsoft/layoutlmv2-base-uncased")
 
-        >>> data = datasets[0]
-        >>> image = Image.open(data["image_path"]).convert("RGB")
-        >>> words = data["words"]
-        >>> boxes = data["bboxes"]  # make sure to normalize your bounding boxes
-        >>> word_labels = data["ner_tags"]
-        >>> encoding = processor(
-        ...     image,
-        ...     words,
-        ...     boxes=boxes,
-        ...     word_labels=word_labels,
-        ...     padding="max_length",
-        ...     truncation=True,
-        ...     return_tensors="pt",
-        ... )
+        >>> image = Image.open("name_of_your_document - can be a png file, pdf, etc.").convert("RGB")
+        >>> words = ["hello", "world"]
+        >>> boxes = [[1, 2, 3, 4], [5, 6, 7, 8]]  # make sure to normalize your bounding boxes
+        >>> word_labels = [0, 1]
+
+        >>> encoding = processor(image, words, boxes=boxes, word_labels=word_labels, return_tensors="pt")
 
         >>> outputs = model(**encoding)
-        >>> logits, loss = outputs.logits, outputs.loss
-
-        >>> predicted_token_class_ids = logits.argmax(-1)
-        >>> predicted_tokens_classes = [id2label[t.item()] for t in predicted_token_class_ids[0]]
-        >>> predicted_tokens_classes[:5]
-        ['B-ANSWER', 'B-HEADER', 'B-HEADER', 'B-HEADER', 'B-HEADER']
-        ```
-        """
+        >>> loss = outputs.loss
+        >>> logits = outputs.logits
+        ```"""
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1297,20 +1247,20 @@ class LayoutLMv2ForQuestionAnswering(LayoutLMv2PreTrainedModel):
     @replace_return_docstrings(output_type=QuestionAnsweringModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        image: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
+        input_ids=None,
+        bbox=None,
+        image=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        start_positions=None,
+        end_positions=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
         r"""
         start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for position (index) of the start of the labelled span for computing the token classification loss.
@@ -1323,49 +1273,28 @@ class LayoutLMv2ForQuestionAnswering(LayoutLMv2PreTrainedModel):
 
         Returns:
 
-        Example:
-
-        In this example below, we give the LayoutLMv2 model an image (of texts) and ask it a question. It will give us
-        a prediction of what it thinks the answer is (the span of the answer within the texts parsed from the image).
+        Examples:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForQuestionAnswering, set_seed
-        >>> import torch
+        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForQuestionAnswering
         >>> from PIL import Image
-        >>> from datasets import load_dataset
+        >>> import torch
 
-        >>> set_seed(88)
         >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
         >>> model = LayoutLMv2ForQuestionAnswering.from_pretrained("microsoft/layoutlmv2-base-uncased")
 
-        >>> dataset = load_dataset("hf-internal-testing/fixtures_docvqa")
-        >>> image_path = dataset["test"][0]["file"]
-        >>> image = Image.open(image_path).convert("RGB")
-        >>> question = "When is coffee break?"
+        >>> image = Image.open("name_of_your_document - can be a png file, pdf, etc.").convert("RGB")
+        >>> question = "what's his name?"
+
         >>> encoding = processor(image, question, return_tensors="pt")
+        >>> start_positions = torch.tensor([1])
+        >>> end_positions = torch.tensor([3])
 
-        >>> outputs = model(**encoding)
-        >>> predicted_start_idx = outputs.start_logits.argmax(-1).item()
-        >>> predicted_end_idx = outputs.end_logits.argmax(-1).item()
-        >>> predicted_start_idx, predicted_end_idx
-        (154, 287)
-
-        >>> predicted_answer_tokens = encoding.input_ids.squeeze()[predicted_start_idx : predicted_end_idx + 1]
-        >>> predicted_answer = processor.tokenizer.decode(predicted_answer_tokens)
-        >>> predicted_answer  # results are not very good without further fine-tuning
-        'council mem - bers conducted by trrf treasurer philip g. kuehn to get answers which the public ...
-        ```
-
-        ```python
-        >>> target_start_index = torch.tensor([7])
-        >>> target_end_index = torch.tensor([14])
-        >>> outputs = model(**encoding, start_positions=target_start_index, end_positions=target_end_index)
-        >>> predicted_answer_span_start = outputs.start_logits.argmax(-1).item()
-        >>> predicted_answer_span_end = outputs.end_logits.argmax(-1).item()
-        >>> predicted_answer_span_start, predicted_answer_span_end
-        (154, 287)
-        ```
-        """
+        >>> outputs = model(**encoding, start_positions=start_positions, end_positions=end_positions)
+        >>> loss = outputs.loss
+        >>> start_scores = outputs.start_logits
+        >>> end_scores = outputs.end_logits
+        ```"""
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1426,6 +1355,7 @@ class LayoutLMv2ForQuestionAnswering(LayoutLMv2PreTrainedModel):
             attentions=outputs.attentions,
         )
 
+
 class BiaffineAttention(nn.Module):
     """Implements a biaffine attention operator for binary relation classification.
     PyTorch implementation of the biaffine attention operator from "End-to-end neural relation
@@ -1450,23 +1380,30 @@ class BiaffineAttention(nn.Module):
         >>> print(output.size())
         torch.Size([32, 4])
     """
+
     def __init__(self, in_features, out_features):
         super(BiaffineAttention, self).__init__()
+
         self.in_features = in_features
         self.out_features = out_features
+
         self.bilinear = nn.Bilinear(in_features, in_features, out_features, bias=False)
         self.linear = nn.Linear(2 * in_features, out_features, bias=True)
+
         self.reset_parameters()
+
     def forward(self, x_1, x_2):
         return self.bilinear(x_1, x_2) + self.linear(torch.cat((x_1, x_2), dim=-1))
+
     def reset_parameters(self):
         self.bilinear.reset_parameters()
         self.linear.reset_parameters()
 
+
 class RegionExtractionDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.entity_emb = nn.Embedding(3, config.hidden_size, scale_grad_by_freq=True)
+        self.entity_emb = nn.Embedding(36, config.hidden_size, scale_grad_by_freq=True)
         projection = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size),
             nn.ReLU(),
@@ -1477,52 +1414,75 @@ class RegionExtractionDecoder(nn.Module):
         )
         self.ffnn_head = copy.deepcopy(projection)
         self.ffnn_tail = copy.deepcopy(projection)
-        self.rel_classifier = BiaffineAttention(config.hidden_size // 2, 2)
+        self.rel_classifier = BiaffineAttention(config.hidden_size // 2, 4)
         self.loss_fct = nn.CrossEntropyLoss()
+
     def build_relation(self, relations, entities):
         batch_size = len(relations)
         new_relations = []
         for b in range(batch_size):
             if len(entities[b]["start"]) <= 2:
                 entities[b] = {"end": [1, 1], "label": [0, 0], "start": [0, 0]}
+#            possible_relations =  [[7, 0], [7, 23], [7, 20], [7, 10], [7, 6], [7, 12], [7, 14], [15, 16], [15, 18], [15, 19], [15, 5], [15, 26], [15, 27], [15, 15], [16, 16], [16, 13], [16, 2], [13, 13], [19, 7], [19, 13], [19, 19], [17, 22], [17, 17], [17, 25], [17, 11], [17, 7], [17, 13], [5, 5], [5, 25], [5, 22], [5, 11], [22, 22], [3, 20], [3, 0], [3, 6], [27, 1], [27, 27], [27, 21], [1, 1], [11, 11], [26, 26], [2, 13], [2, 2], [24, 24], [23, 23], [12, 5], [18, 18], [18, 7], [18, 13], [25, 25], [4, 19]]
+      
+            possible_relations = [[24, 18], [24, 30], [24, 23], [24, 25], [24, 20], [24, 11], [24, 12], [24, 15], [6, 7], [6, 0], [6, 10], [6, 1], [6, 30], [6, 28], [6, 29], [6, 4], [6, 14], [6, 6], [6, 16], [6, 17], [17, 0], [17, 1], [17, 13], [17, 2], [17, 28], [17, 17], [13, 13], [0, 0], [0, 1], [0, 13], [0, 30], [0, 24], [0, 17], [32, 9], [32, 1], [32, 30], [32, 24], [32, 27], [32, 26], [32, 28], [32, 29], [32, 32], [32, 13], [32, 34], [7, 26], [7, 27], [7, 9], [7, 7], [9, 9], [4, 4], [4, 10], [4, 19], [4, 31], [5, 11], [5, 5], [5, 18], [5, 23], [5, 15], [31, 31], [16, 16], [16, 13], [28, 28], [2, 13], [2, 2], [10, 10], [29, 1], [29, 30], [29, 23], [29, 24], [29, 29], [29, 4], [29, 13], [29, 15], [29, 34], [34, 23], [34, 24], [34, 15], [34, 29], [34, 34], [8, 8], [14, 24], [14, 14], [14, 13], [33, 33], [11, 11], [23, 23], [27, 27], [26, 26], [18, 18], [12, 12], [15, 15]]
             all_possible_relations = set(
                 [
                     (i, j)
                     for i in range(len(entities[b]["label"]))
                     for j in range(len(entities[b]["label"]))
-                    if entities[b]["label"][i] == 1 and entities[b]["label"][j] == 2
+                    if [entities[b]["label"][i],entities[b]["label"][j]] in possible_relations
+#                    if entities[b]["label"][i] == 1 and entities[b]["label"][j] == 2
                 ]
             )
             if len(all_possible_relations) == 0:
                 all_possible_relations = set([(0, 1)])
-            positive_relations = set(list(zip(relations[b]["head"], relations[b]["tail"])))
-            negative_relations = all_possible_relations - positive_relations
-            positive_relations = set([i for i in positive_relations if i in all_possible_relations])
-            reordered_relations = list(positive_relations) + list(negative_relations)
+            parent_child_relation = set([(relations[b]["head"][i], relations[b]["tail"][i]) for i in range(len(relations[b]["type"])) if relations[b]["type"][i] == "parent_child"])
+            peer_relation = set([(relations[b]["head"][i], relations[b]["tail"][i]) for i in range(len(relations[b]["type"])) if relations[b]["type"][i] == "peer_linking"])
+            same_relation = set([(relations[b]["head"][i], relations[b]["tail"][i]) for i in range(len(relations[b]["type"])) if relations[b]["type"][i] =="same_label"])
+            negative_relations = all_possible_relations - parent_child_relation - peer_relation - same_relation
+            parent_child_relation = set([i for i in parent_child_relation if i in all_possible_relations])
+            peer_relation = set([i for i in peer_relation if i in all_possible_relations])
+            same_relation = set([i for i in same_relation if i in all_possible_relations])
+            reordered_relations = list(same_relation) + list(parent_child_relation)+ list(peer_relation) + list(negative_relations)
+
+#            positive_relations = set(list(zip(relations[b]["head"], relations[b]["tail"])))
+#            negative_relations = all_possible_relations - positive_relations
+#            positive_relations = set([i for i in positive_relations if i in all_possible_relations])
+#            reordered_relations = list(positive_relations) + list(negative_relations)
             relation_per_doc = {"head": [], "tail": [], "label": []}
             relation_per_doc["head"] = [i[0] for i in reordered_relations]
             relation_per_doc["tail"] = [i[1] for i in reordered_relations]
-            relation_per_doc["label"] = [1] * len(positive_relations) + [0] * (
-                len(reordered_relations) - len(positive_relations)
-            )
+            relation_per_doc["label"] = [3]*len(same_relation) + [2] * len(parent_child_relation) + [1] * len(peer_relation) + [0] * ( len(reordered_relations) - len(parent_child_relation) - len(peer_relation) - len(same_relation))
+
+#            relation_per_doc["label"] = [1] * len(positive_relations) + [0] * (
+#                len(reordered_relations) - len(positive_relations)
+#            )
             assert len(relation_per_doc["head"]) != 0
             new_relations.append(relation_per_doc)
         return new_relations, entities
+
     def get_predicted_relations(self, logits, relations, entities):
         pred_relations = []
+        labels = {3:'same_label',2:'parent_child_relation',1:'peer_relation'}
+        class_prob = torch.softmax(logits, dim=-1)
+        conf, classes = torch.max(class_prob, -1)
         for i, pred_label in enumerate(logits.argmax(-1)):
-            if pred_label != 1:
+            if pred_label == 0:
                 continue
             rel = {}
             rel["head_id"] = relations["head"][i]
             rel["head"] = (entities["start"][rel["head_id"]], entities["end"][rel["head_id"]])
             rel["head_type"] = entities["label"][rel["head_id"]]
+
             rel["tail_id"] = relations["tail"][i]
             rel["tail"] = (entities["start"][rel["tail_id"]], entities["end"][rel["tail_id"]])
             rel["tail_type"] = entities["label"][rel["tail_id"]]
-            rel["type"] = 1
+            rel["type"] = labels[pred_label.tolist()]
+            rel['confidence'] = float(np.round(conf.cpu().data[i].numpy(),3))
             pred_relations.append(rel)
         return pred_relations
+
     def forward(self, hidden_states, entities, relations):
         batch_size, max_n_words, context_dim = hidden_states.size()
         device = hidden_states.device
@@ -1538,9 +1498,11 @@ class RegionExtractionDecoder(nn.Module):
             head_index = entities_start_index[head_entities]
             head_label = entities_labels[head_entities]
             head_label_repr = self.entity_emb(head_label)
+
             tail_index = entities_start_index[tail_entities]
             tail_label = entities_labels[tail_entities]
             tail_label_repr = self.entity_emb(tail_label)
+
             head_repr = torch.cat(
                 (hidden_states[b][head_index], head_label_repr),
                 dim=-1,
@@ -1556,6 +1518,7 @@ class RegionExtractionDecoder(nn.Module):
             pred_relations = self.get_predicted_relations(logits, relations[b], entities[b])
             all_pred_relations.append(pred_relations)
         return loss, all_pred_relations
+
 @add_start_docstrings(
     """
     LayoutLMv2 Model with a relation extract head ontop for identifying relations between different groups of text
@@ -1571,8 +1534,10 @@ class LayoutLMv2ForRelationExtraction(LayoutLMv2PreTrainedModel):
         self.layoutlmv2 = LayoutLMv2Model(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.extractor = RegionExtractionDecoder(config)
+
         # Initialize weights and apply final processing
         self.post_init()
+
     @add_start_docstrings_to_model_forward(LAYOUTLMV2_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=RegionExtractionOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1617,19 +1582,25 @@ class LayoutLMv2ForRelationExtraction(LayoutLMv2PreTrainedModel):
                     Each value in this list represents the end index (element of range(0, len(tokens)) for the
                     combined head and tail entities e.g. `min(entities['end']['head'], entities['end']['tail'])`
             }
+
         Returns:
+
         Examples:
+
         ```python
         >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForTokenClassification
         >>> from PIL import Image
+
         >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased", revision="no_ocr")
         >>> model = LayoutLMv2ForRelationExtraction.from_pretrained("microsoft/layoutlmv2-base-uncased")
+
         >>> image = Image.open("name_of_your_document - can be a png file, pdf, etc.").convert("RGB")
         >>> words = ["hello", "world"]
         >>> boxes = [[1, 2, 3, 4], [5, 6, 7, 8]]  # make sure to normalize your bounding boxes
         >>> entities = *****
         >>> relations = *****
         ```"""
+
         outputs = self.layoutlmv2(
             input_ids=input_ids,
             bbox=bbox,
@@ -1639,10 +1610,12 @@ class LayoutLMv2ForRelationExtraction(LayoutLMv2PreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
         )
+
         seq_length = input_ids.size(1)
         sequence_output, image_output = outputs[0][:, :seq_length], outputs[0][:, seq_length:]
         sequence_output = self.dropout(sequence_output)
         loss, pred_relations = self.extractor(sequence_output, entities, relations)
+
         return RegionExtractionOutput(
             loss=loss,
             entities=entities,
