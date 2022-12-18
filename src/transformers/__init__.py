@@ -1544,6 +1544,7 @@ else:
     _import_structure["models.layoutlmv2"].extend(
         [
             "LAYOUTLMV2_PRETRAINED_MODEL_ARCHIVE_LIST",
+            "LayoutLMv2ForRelationExtraction"
             "LayoutLMv2ForQuestionAnswering",
             "LayoutLMv2ForSequenceClassification",
             "LayoutLMv2ForTokenClassification",
