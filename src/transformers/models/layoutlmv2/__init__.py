@@ -58,6 +58,7 @@ except OptionalDependencyNotAvailable:
 else:
     _import_structure["modeling_layoutlmv2"] = [
         "LAYOUTLMV2_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "LayoutLMv2ForRelationExtraction",
         "LayoutLMv2ForQuestionAnswering",
         "LayoutLMv2ForSequenceClassification",
         "LayoutLMv2ForTokenClassification",
@@ -95,6 +96,7 @@ if TYPE_CHECKING:
     else:
         from .modeling_layoutlmv2 import (
             LAYOUTLMV2_PRETRAINED_MODEL_ARCHIVE_LIST,
+            LayoutLMv2ForRelationExtraction,
             LayoutLMv2ForQuestionAnswering,
             LayoutLMv2ForSequenceClassification,
             LayoutLMv2ForTokenClassification,
